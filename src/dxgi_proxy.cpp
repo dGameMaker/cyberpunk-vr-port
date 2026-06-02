@@ -719,6 +719,12 @@ extern "C" int GetSyncSequential() {
     // Virtual Desktop masks it, so it stays off there (already smooth on the
     // per-eye path). Confirmed direction by the user's both-left/both-right=smooth
     // test: identical per-eye pose = smooth, differing per-eye pose = left tears.
+    // Key off the ACTUALLY-detected runtime (by name), not just the xr_runtime ini
+    // flag: SteamVR can be the system default OpenXR runtime with xr_runtime=0, and
+    // the lock must still engage there or the left-eye judder returns.
+    if (OpenXRManager::Get().IsRuntimeSteamVR()) {
+        return 1;
+    }
     return g_liveControls.xrRuntime == 1 ? 1 : 0;
 }
 

@@ -47,6 +47,7 @@ public:
     // time-warp the older 1/2-rate eye forward to display time. See render-pose submit.
     void StoreRenderEyePose(int eye, const OpenXRHeadPose& pose, uint32_t seq);
     float GetRuntimeHorizontalFovDeg() const { return m_runtimeHorizontalFovDeg.load(std::memory_order_relaxed); }
+    bool IsRuntimeSteamVR() const { return m_runtimeIsSteamVR.load(std::memory_order_relaxed); }
     float GetRuntimeVerticalFovDeg() const { return m_runtimeVerticalFovDeg.load(std::memory_order_relaxed); }
     float GetRuntimeIpd() const { return m_runtimeIpd.load(std::memory_order_relaxed); }
     

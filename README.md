@@ -99,6 +99,11 @@ This is the preferred file for community bug reports.
 
 *Photos were taken through PICO 4 lenses using an iPhone 13 Pro Max.*
 
+![Boe6Eod7Nty Valve Index](images/Boe6Eod7Nty_valve_index.jpg)
+![Boe6Eod7Nty Valve Index 2](images/Boe6Eod7Nty_valve_index_2.jpg)
+
+*Valve Index (canted-display OpenXR) shots courtesy of [Boe6Eod7Nty](https://github.com/Boe6Eod7Nty).*
+
 ## Test Hardware Used During Development
 
 - Headset: PICO 4 (via VDXR)

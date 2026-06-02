@@ -383,18 +383,15 @@ static int64_t PickMonoSwapchainFormat(const std::vector<int64_t>& runtimeFormat
 }
 
 static XrFovf ApplyForcedProjectionFov(const XrFovf& sourceFov, float width, float height) {
-    const float forceFov = GetForcedFov();
+    float forceFov = GetForcedFov();
+    if (forceFov <= 1.0f || forceFov >= 170.0f) {
+        forceFov = OpenXRManager::Get().GetRuntimeHorizontalFovDeg();
+    }
     if (forceFov <= 1.0f || forceFov >= 170.0f) {
         return sourceFov;
     }
 
-    float aspect = 1.0f;
-    if (width > 1.0f && height > 1.0f) {
-        aspect = width / height;
-    }
-    if (aspect < 0.01f) {
-        aspect = 1.0f;
-    }
+    const float aspect = 1.0f; //tells OpenXR vertical FOV matches horizontal. Prevends vertical camera stretching.
 
     const float halfFovH = (forceFov * 3.1415926535f / 180.0f) * 0.5f;
     const float halfFovV = atanf(tanf(halfFovH) / aspect);
@@ -1498,7 +1495,15 @@ bool OpenXRManager::Init() {
             XR_VERSION_MAJOR(instanceProps.runtimeVersion),
             XR_VERSION_MINOR(instanceProps.runtimeVersion),
             XR_VERSION_PATCH(instanceProps.runtimeVersion));
-        if (GetXrRuntimeMode() == 1 && strcmp(ClassifyOpenXRRuntime(instanceProps.runtimeName), "SteamVR") != 0) {
+        const bool actuallySteamVR = strcmp(ClassifyOpenXRRuntime(instanceProps.runtimeName), "SteamVR") == 0;
+        // Detect the ACTIVE runtime by name, independent of the xr_runtime ini flag.
+        // The pose-pair lock (GetSyncSequential) keys off this so SteamVR gets the
+        // fix even when launched as the SYSTEM default OpenXR runtime with
+        // xr_runtime=0 (otherwise left-eye judder/tearing returns).
+        m_runtimeIsSteamVR.store(actuallySteamVR, std::memory_order_relaxed);
+        Log("OpenXRManager: runtimeIsSteamVR=%d (pose-pair lock %s)\n",
+            actuallySteamVR ? 1 : 0, actuallySteamVR ? "ENABLED" : "off");
+        if (GetXrRuntimeMode() == 1 && !actuallySteamVR) {
             Log("OpenXRManager: xr_runtime=1 requested SteamVR, but the active runtime identified as %s.\n", ClassifyOpenXRRuntime(instanceProps.runtimeName));
         }
     }
