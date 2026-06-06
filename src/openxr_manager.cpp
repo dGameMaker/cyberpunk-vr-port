@@ -3032,6 +3032,16 @@ void OpenXRManager::OnPresent(IDXGISwapChain* swapChain) {
         s_pSharedHands[13] = finalQy;
         s_pSharedHands[14] = finalQz;
         s_pSharedHands[15] = finalQw;
+
+        // [16..19] HMD orientation relative to the recenter base (relOri = baseInv*Qhead).
+        // The controller positions above are stored in HMD-LOCAL space (headInv*(hand-head)),
+        // so the RED4ext arm-IK plugin multiplies rawController by this quat to undo the head
+        // rotation: relOri*rawHandLocal = baseInv*(hand-head)world -> head-independent offset
+        // in the body-forward frame. Without this the hand swings/inverts when the head turns.
+        s_pSharedHands[16] = m_oriX.load(std::memory_order_relaxed);
+        s_pSharedHands[17] = m_oriY.load(std::memory_order_relaxed);
+        s_pSharedHands[18] = m_oriZ.load(std::memory_order_relaxed);
+        s_pSharedHands[19] = m_oriW.load(std::memory_order_relaxed);
     }
 
     if (!swapChain) return;

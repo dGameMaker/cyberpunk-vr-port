@@ -106,10 +106,46 @@ volatile int       g_VRBind = 0;
 volatile float     g_VRBindScale = 1.0f;
 volatile float     g_VRBindOffX = 0.0f;
 volatile float     g_VRBindOffY = 0.0f;
-volatile float     g_VRBindOffZ = 0.0f;
+volatile float     g_VRBindOffZ = 0.23f;  // calibrated: hand anchored ~0.23m above head bone
 volatile int       g_VRBindAxis = 1;     // Y-up -> Z-up mapping by default
+// Calibrated per-hand wrist corrections: right = euler(0,-90,0), left = euler(-180,-90,0).
+volatile float     g_VRWristR_I = 0.0f,        g_VRWristR_J = -0.70710678f, g_VRWristR_K = 0.0f,        g_VRWristR_R = 0.70710678f;
+volatile float     g_VRWristL_I = -0.70710678f, g_VRWristL_J = 0.0f,        g_VRWristL_K = 0.70710678f, g_VRWristL_R = 0.0f;
+// Per-hand reach scale + position offset (calibrated: R slightly shorter avatar reach than L).
+volatile float     g_VRScaleR = 1.05f, g_VRScaleL = 1.06f;
+volatile float     g_VROffRX = 0.0f, g_VROffRY = 0.0f, g_VROffRZ = 0.23f;
+volatile float     g_VROffLX = 0.0f, g_VROffLY = 0.0f, g_VROffLZ = 0.23f;
+// Per-hand elbow pole spin (degrees): fine outward/inward nudge of the bend normal; 0 = natural.
+volatile float     g_VRElbowPoleR = 0.0f, g_VRElbowPoleL = 0.0f;
+// VRArmIK elbow-swing heuristic gain (per hand). 1.0 = faithful VRArmIK; the left arm is
+// mirrored inside the solver, so both default to +1.0.
+volatile float     g_VRElbowSwingR = 1.0f, g_VRElbowSwingL = 1.0f;
 volatile int       g_VRRightBoneIdx = 24;
 volatile int       g_VRLeftBoneIdx = 23;
+volatile int       g_VRHeadBoneIdx = -1;  // resolved from metaRig bone names in VRIK_DoArmPlayer
+volatile int       g_VRUseHeadRelative = 1;
+volatile int       g_VRDiagCapture = 0;
+float              g_VRDiagBones[32 * 7] = {0};
+
+// Full-arm IK (g_VRBind == 4): bone hierarchy + chain indices (resolved in VRIK_DoArmPlayer).
+int16_t            g_VRBoneParent[256] = {0};
+volatile int       g_VRBoneCount = 0;
+volatile int       g_VRRightUpperArmIdx = -1; // RightArm  (upper-arm start / shoulder joint)
+volatile int       g_VRRightForeArmIdx  = -1; // RightForeArm (elbow)
+volatile int       g_VRLeftUpperArmIdx  = -1; // LeftArm
+volatile int       g_VRLeftForeArmIdx   = -1; // LeftForeArm
+
+// IK diagnostics (last solve, model space).
+volatile float     g_VRIKDbgTarget[3]   = {0,0,0};
+volatile float     g_VRIKDbgShoulder[3] = {0,0,0};
+volatile float     g_VRIKDbgElbow[3]    = {0,0,0};
+volatile float     g_VRIKDbgLocal[4]    = {0,0,0,0};
+volatile float     g_VRIKDbgTargetL[3]  = {0,0,0};
+volatile float     g_VRIKDbgShoulderL[3]= {0,0,0};
+volatile float     g_VRIKDbgElbowL[3]   = {0,0,0};
+volatile float     g_VRIKDbgLensL[2]    = {0,0};
+volatile float     g_VRIKDbgLocalL[4]   = {0,0,0,0};
+volatile float     g_VRIKDbgLens[2]     = {0,0};
 
 static RED4ext::world::AnimationSystem* ScanForAnimationSystemInBlock(uint8_t* aBase, size_t aSize, std::ofstream* aOut = nullptr);
 static const char* ClassifyQword(uint64_t v);
@@ -130,6 +166,15 @@ static bool ContainsInsensitive(const char* haystack, const char* needle) {
     std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return h.find(n) != std::string::npos;
+}
+
+static bool EqualsInsensitive(const char* a, const char* b) {
+    if (!a || !b) return false;
+    for (; *a && *b; ++a, ++b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b)))
+            return false;
+    }
+    return *a == *b;
 }
 
 static bool ClassIsA(RED4ext::CClass* type, RED4ext::CName className) {
@@ -2188,7 +2233,10 @@ void UpdateVRIKAnimInputs(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* 
         int req = static_cast<int>(g_pSharedHands[32]);
         if (req > 0) {
             if (!s_vrHooksInstalled) {
-                InstallVRIKMinHook();
+                // Only the pose-apply hook is needed. The old ComponentFunc21 hook
+                // (InstallVRIKMinHook) is a dead end -- g_PlayerAnimComponent is never
+                // assigned so it does nothing, yet it trampolines a super-hot per-component
+                // Update function and tanked FPS (70+ -> 10-15).
                 InstallAnimPoseHook();
                 s_vrHooksInstalled = true;
             }
@@ -3511,9 +3559,10 @@ void GetPlayerBoneBufferAddress(RED4ext::IScriptable* aContext, RED4ext::CStackF
 void InstallVRAnimPoseHook(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
     aFrame->code++;
-    bool ok1 = InstallVRIKMinHook();
-    bool ok2 = InstallAnimPoseHook();
-    if (aOut) *aOut = (ok1 && ok2) ? 1 : 0;
+    // Only the pose-apply hook is installed; the ComponentFunc21 hook is dead code
+    // that crushed FPS (see UpdateVRIKAnimInputs note).
+    bool ok = InstallAnimPoseHook();
+    if (aOut) *aOut = ok ? 1 : 0;
 }
 
 // Resolves the player's live track buffers (a2[7][3] candidates) so the hook can
@@ -3535,6 +3584,80 @@ static int VRIK_DoArmPlayer() {
     void* ownerB = *reinterpret_cast<void**>(base + 0x18);
     if (VRIK_IsReadable(ownerB, 0x20))
         g_PlayerTrackBufB = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(ownerB) + 0x18);
+
+    // Resolve the head + hand bone indices from the metaRig bone names so the
+    // pose hook does not rely on hard-coded guesses. The buffer the hook writes
+    // (a2[7][0]) is indexed the same as metaRig->boneNames. Prefer an exact name
+    // match, fall back to the shortest name containing the needles (so we get the
+    // hand root, not a finger like "RightHandThumb1").
+    auto* metaRig = animObj->metaRig;
+    if (metaRig && std::strcmp(ClassifyQword(reinterpret_cast<uint64_t>(metaRig)), "HEAP") == 0)
+    {
+        const uint32_t boneCount = metaRig->boneNames.Size();
+        if (boneCount > 0 && boneCount < 8192)
+        {
+            int head = -1, rightHand = -1, leftHand = -1;
+            int rightArm = -1, rightFore = -1, leftArm = -1, leftFore = -1;
+            const size_t kNoMatch = static_cast<size_t>(-1);
+            size_t headLen = kNoMatch, rightLen = kNoMatch, leftLen = kNoMatch;
+            for (uint32_t i = 0; i < boneCount; ++i)
+            {
+                const char* nm = metaRig->boneNames[i].ToString();
+                if (!nm || !nm[0])
+                    continue;
+                const size_t len = std::strlen(nm);
+
+                if (EqualsInsensitive(nm, "Head")) { head = static_cast<int>(i); headLen = 0; }
+                else if (headLen != 0 && ContainsInsensitive(nm, "head") && len < headLen)
+                { head = static_cast<int>(i); headLen = len; }
+
+                const bool isHand = ContainsInsensitive(nm, "hand");
+                if (isHand && ContainsInsensitive(nm, "right"))
+                {
+                    if (EqualsInsensitive(nm, "RightHand")) { rightHand = static_cast<int>(i); rightLen = 0; }
+                    else if (rightLen != 0 && len < rightLen) { rightHand = static_cast<int>(i); rightLen = len; }
+                }
+                if (isHand && ContainsInsensitive(nm, "left"))
+                {
+                    if (EqualsInsensitive(nm, "LeftHand")) { leftHand = static_cast<int>(i); leftLen = 0; }
+                    else if (leftLen != 0 && len < leftLen) { leftHand = static_cast<int>(i); leftLen = len; }
+                }
+
+                // Arm-chain joints for the full IK (exact names on the player rig).
+                if (EqualsInsensitive(nm, "RightArm"))     rightArm  = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "RightForeArm")) rightFore = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "LeftArm"))      leftArm   = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "LeftForeArm"))  leftFore  = static_cast<int>(i);
+            }
+
+            if (head >= 0)      g_VRHeadBoneIdx  = head;
+            if (rightHand >= 0) g_VRRightBoneIdx = rightHand;
+            if (leftHand >= 0)  g_VRLeftBoneIdx  = leftHand;
+            if (rightArm >= 0)  g_VRRightUpperArmIdx = rightArm;
+            if (rightFore >= 0) g_VRRightForeArmIdx  = rightFore;
+            if (leftArm >= 0)   g_VRLeftUpperArmIdx  = leftArm;
+            if (leftFore >= 0)  g_VRLeftForeArmIdx   = leftFore;
+
+            // Copy the parent-index table so the pose hook can run FK each frame.
+            const uint32_t pc = metaRig->parentIndeces.Size();
+            const uint32_t copyN = (pc < boneCount ? pc : boneCount);
+            int written = 0;
+            for (uint32_t i = 0; i < copyN && i < 256; ++i) { g_VRBoneParent[i] = metaRig->parentIndeces[i]; ++written; }
+            g_VRBoneCount = written;
+
+            std::ofstream out("C:\\Users\\dariulone\\Desktop\\CyberpunkVRPort\\vrik_bone_resolve.txt", std::ios::trunc);
+            if (out.is_open())
+                out << "boneCount=" << boneCount
+                    << " parentCount=" << pc
+                    << " head=" << g_VRHeadBoneIdx
+                    << " rightHand=" << g_VRRightBoneIdx
+                    << " leftHand=" << g_VRLeftBoneIdx
+                    << " rightArm=" << g_VRRightUpperArmIdx
+                    << " rightForeArm=" << g_VRRightForeArmIdx
+                    << " leftArm=" << g_VRLeftUpperArmIdx
+                    << " leftForeArm=" << g_VRLeftForeArmIdx << "\n";
+        }
+    }
 
     return (g_PlayerTrackBufA ? 1 : 0) | (g_PlayerTrackBufB ? 2 : 0);
 }
@@ -3618,14 +3741,22 @@ volatile float g_VRCamR = 1.0f;
 
 void SetVRPlayerYaw(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
-    
+
     float pYaw = 0.0f;
-    
+    float ci = 0.0f, cj = 0.0f, ck = 0.0f, cr = 1.0f;
+
     RED4ext::GetParameter(aFrame, &pYaw);
+    RED4ext::GetParameter(aFrame, &ci);
+    RED4ext::GetParameter(aFrame, &cj);
+    RED4ext::GetParameter(aFrame, &ck);
+    RED4ext::GetParameter(aFrame, &cr);
     aFrame->code++;
-    
+
     g_VRPlayerYaw = pYaw;
-    
+    // FPP camera (HMD) world quaternion -- used by the full-arm IK to place the
+    // hand target in world space (world->model via -yaw), so head turns don't drag it.
+    g_VRCamI = ci; g_VRCamJ = cj; g_VRCamK = ck; g_VRCamR = cr;
+
     if (aOut) *aOut = 1;
 }
 
@@ -3637,23 +3768,86 @@ void SetVRBindMode(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
     if (aOut) *aOut = 1;
 }
 
+// Per-hand reach scale + position offset. hand: 0 = right, 1 = left, else = both.
+// Also keeps the legacy global scale/offset (modes 1..3) in sync when hand == both.
 void SetVRBindParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
     float scale = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f;
-    int32_t axis = 1;
+    int32_t axis = 1, hand = 2;
     RED4ext::GetParameter(aFrame, &scale);
     RED4ext::GetParameter(aFrame, &x);
     RED4ext::GetParameter(aFrame, &y);
     RED4ext::GetParameter(aFrame, &z);
     RED4ext::GetParameter(aFrame, &axis);
+    RED4ext::GetParameter(aFrame, &hand);
     aFrame->code++;
-    
-    g_VRBindScale = scale;
-    g_VRBindOffX = x;
-    g_VRBindOffY = y;
-    g_VRBindOffZ = z;
+
     g_VRBindAxis = axis;
-    
+    if (hand != 1) { g_VRScaleR = scale; g_VROffRX = x; g_VROffRY = y; g_VROffRZ = z; }
+    if (hand != 0) { g_VRScaleL = scale; g_VROffLX = x; g_VROffLY = y; g_VROffLZ = z; }
+    if (hand == 2) { // also drive legacy globals used by modes 1..3
+        g_VRBindScale = scale; g_VRBindOffX = x; g_VRBindOffY = y; g_VRBindOffZ = z;
+    }
+
+    if (aOut) *aOut = 1;
+}
+
+// Per-hand elbow pole spin in degrees (rotates the IK elbow direction around the
+// shoulder->hand axis). hand: 0 = right, 1 = left, else = both.
+void SetVRElbowPole(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float angle = 0.0f;
+    int32_t hand = 2;
+    RED4ext::GetParameter(aFrame, &angle);
+    RED4ext::GetParameter(aFrame, &hand);
+    aFrame->code++;
+    if (hand != 1) g_VRElbowPoleR = angle;
+    if (hand != 0) g_VRElbowPoleL = angle;
+    if (aOut) *aOut = 1;
+}
+
+// Per-hand elbow-swing gain. Scales the VRArmIK position heuristic that swings the elbow
+// as the hand sweeps through its arc. 1.0 = faithful VRArmIK, 0 = elbow locked straight
+// down, negative = swing the other way. hand: 0 = right, 1 = left, else = both.
+void SetVRElbowSwing(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float gain = 1.0f;
+    int32_t hand = 2;
+    RED4ext::GetParameter(aFrame, &gain);
+    RED4ext::GetParameter(aFrame, &hand);
+    aFrame->code++;
+    if (hand != 1) g_VRElbowSwingR = gain;
+    if (hand != 0) g_VRElbowSwingL = gain;
+    if (aOut) *aOut = 1;
+}
+
+// Constant wrist-orientation correction (degrees, hand-local pitch/yaw/roll) per hand.
+// hand: 0 = right, 1 = left, anything else = both. Lets the user dial in the palm/finger
+// alignment live from the CET console without a rebuild. Applied as handRot = mapQuat *
+// wristCorr in VRIK_BuildHandTarget. Calibrated defaults: R(0,-90,0), L(-180,-90,0).
+void SetVRHandOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
+    int32_t hand = 2; // default: both
+    RED4ext::GetParameter(aFrame, &pitch);
+    RED4ext::GetParameter(aFrame, &yaw);
+    RED4ext::GetParameter(aFrame, &roll);
+    RED4ext::GetParameter(aFrame, &hand);
+    aFrame->code++;
+
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    // XYZ (pitch about X, yaw about Y, roll about Z) intrinsic compose.
+    float qi = sp*cy*cr + cp*sy*sr;
+    float qj = cp*sy*cr - sp*cy*sr;
+    float qk = cp*cy*sr + sp*sy*cr;
+    float qr = cp*cy*cr - sp*sy*sr;
+
+    if (hand != 1) { g_VRWristR_I = qi; g_VRWristR_J = qj; g_VRWristR_K = qk; g_VRWristR_R = qr; }
+    if (hand != 0) { g_VRWristL_I = qi; g_VRWristL_J = qj; g_VRWristL_K = qk; g_VRWristL_R = qr; }
+
     if (aOut) *aOut = 1;
 }
 
@@ -3667,6 +3861,133 @@ void SetVRBindBones(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     g_VRLeftBoneIdx = leftIdx;
     g_VRRightBoneIdx = rightIdx;
     
+    if (aOut) *aOut = 1;
+}
+
+// Override the resolved head bone index (calibration). -1 disables head-relative.
+void SetVRHeadBone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t idx = -1;
+    RED4ext::GetParameter(aFrame, &idx);
+    aFrame->code++;
+    g_VRHeadBoneIdx = idx;
+    if (aOut) *aOut = g_VRHeadBoneIdx;
+}
+
+// Toggle head-relative hand composition (1 = on, 0 = write head-local offset directly).
+void SetVRUseHeadRelative(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t on = 1;
+    RED4ext::GetParameter(aFrame, &on);
+    aFrame->code++;
+    g_VRUseHeadRelative = on ? 1 : 0;
+    if (aOut) *aOut = g_VRUseHeadRelative;
+}
+
+void SetVRDiagCapture(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t on = 0;
+    RED4ext::GetParameter(aFrame, &on);
+    aFrame->code++;
+    g_VRDiagCapture = on ? 1 : 0;
+    if (aOut) *aOut = g_VRDiagCapture;
+}
+
+// Diagnostic: logs the gizmo-computed world target (camPos + camQuat*mapLocalPos)
+// next to the actual character arm-bone poses captured from the live pose buffer
+// (g_VRDiagBones, snapshotted pre-write by the hook when SetVRDiagCapture(1)).
+// The decisive lines compare (bufHand - bufHead) against (gizmoWorld - camPos):
+// if they match, the bone buffer is model-space and head-relative IK is valid.
+// Call from Lua each frame (or on a hotkey) passing the FPP camera world pose.
+void LogVRDiag(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float camX = 0, camY = 0, camZ = 0, qi = 0, qj = 0, qk = 0, qr = 1;
+    RED4ext::GetParameter(aFrame, &camX);
+    RED4ext::GetParameter(aFrame, &camY);
+    RED4ext::GetParameter(aFrame, &camZ);
+    RED4ext::GetParameter(aFrame, &qi);
+    RED4ext::GetParameter(aFrame, &qj);
+    RED4ext::GetParameter(aFrame, &qk);
+    RED4ext::GetParameter(aFrame, &qr);
+    aFrame->code++;
+
+    EnsureSharedMemory();
+    if (aOut) *aOut = 0;
+
+    // Right-hand gizmo target, identical math to the CET gizmo (init.lua).
+    float raw[3] = { 0, 0, 0 };
+    if (g_pSharedHands) { raw[0] = g_pSharedHands[9]; raw[1] = g_pSharedHands[10]; raw[2] = g_pSharedHands[11]; }
+    float local[3] = { raw[0], -raw[2], raw[1] };          // mapLocalPos: (x, -z, y)
+    float camQuat[4] = { qi, qj, qk, qr };
+    float worldOff[3];
+    VRIK_QuatRotateVec(camQuat, local, worldOff);
+    float gizmo[3] = { camX + worldOff[0], camY + worldOff[1], camZ + worldOff[2] };
+
+    std::ofstream out("C:\\Users\\dariulone\\Desktop\\CyberpunkVRPort\\vrik_diag.txt", std::ios::app);
+    if (!out.is_open()) { if (aOut) *aOut = -1; return; }
+    out << std::fixed << std::setprecision(4);
+    out << "==== LogVRDiag ====\n";
+    out << "cam.pos  = (" << camX << ", " << camY << ", " << camZ << ")\n";
+    out << "cam.quat = (" << qi << ", " << qj << ", " << qk << ", " << qr << ")\n";
+    out << "VR.rawR  = (" << raw[0] << ", " << raw[1] << ", " << raw[2] << ")\n";
+    out << "gizmoWorld(R) = (" << gizmo[0] << ", " << gizmo[1] << ", " << gizmo[2] << ")\n";
+    // HMD orientation rel to base (slots 16..19) + head-independent base-frame offset.
+    if (g_pSharedHands) {
+        const float* h = &g_pSharedHands[16];
+        float baseOff[3] = {
+            (h[3]*h[3]-h[0]*h[0]-h[1]*h[1]-h[2]*h[2])*raw[0] + 2.0f*(h[0]*h[1]-h[3]*h[2])*raw[1] + 2.0f*(h[0]*h[2]+h[3]*h[1])*raw[2],
+            2.0f*(h[0]*h[1]+h[3]*h[2])*raw[0] + (h[3]*h[3]-h[0]*h[0]+h[1]*h[1]-h[2]*h[2])*raw[1] + 2.0f*(h[1]*h[2]-h[3]*h[0])*raw[2],
+            2.0f*(h[0]*h[2]-h[3]*h[1])*raw[0] + 2.0f*(h[1]*h[2]+h[3]*h[0])*raw[1] + (h[3]*h[3]-h[0]*h[0]-h[1]*h[1]+h[2]*h[2])*raw[2],
+        };
+        out << "hmdRel   = (" << h[0] << ", " << h[1] << ", " << h[2] << ", " << h[3] << ")\n";
+        out << "baseOff(hmdRel*raw) = (" << baseOff[0] << ", " << baseOff[1] << ", " << baseOff[2] << ")\n";
+        out << "mapLocal(x,-z,y)    = (" << baseOff[0] << ", " << -baseOff[2] << ", " << baseOff[1] << ")\n";
+    }
+    out << "headIdx=" << g_VRHeadBoneIdx << " rightIdx=" << g_VRRightBoneIdx << " leftIdx=" << g_VRLeftBoneIdx
+        << " diagCapture=" << g_VRDiagCapture << " lastBoneBuf=0x" << std::hex << g_AnimPoseLastBoneBuf << std::dec << "\n";
+
+    struct NamedBone { int idx; const char* name; };
+    const NamedBone bones[] = {
+        {2, "Hips"}, {13, "Spine3"}, {16, "Neck"}, {22, "Head"},
+        {15, "RightShoulder"}, {18, "RightArm"}, {21, "RightForeArm"}, {24, "RightHand"},
+        {14, "LeftShoulder"},  {17, "LeftArm"},  {20, "LeftForeArm"},  {23, "LeftHand"},
+    };
+    for (const auto& b : bones) {
+        if (b.idx < 0 || b.idx >= 32) continue;
+        const float* d = &g_VRDiagBones[b.idx * 7];
+        out << "bone[" << b.idx << "] " << b.name
+            << " pos=(" << d[0] << ", " << d[1] << ", " << d[2] << ")"
+            << " quat=(" << d[3] << ", " << d[4] << ", " << d[5] << ", " << d[6] << ")\n";
+    }
+
+    // Decisive comparison: model-space buffer => these two offsets match.
+    const float* head = &g_VRDiagBones[22 * 7];
+    const float* hand = &g_VRDiagBones[24 * 7];
+    const float* sh   = &g_VRDiagBones[15 * 7];
+    const float* fa   = &g_VRDiagBones[21 * 7];
+    out << "bufHand24 - bufHead22 = (" << (hand[0]-head[0]) << ", " << (hand[1]-head[1]) << ", " << (hand[2]-head[2]) << ")\n";
+    out << "gizmoWorld  - cam.pos = (" << (gizmo[0]-camX) << ", " << (gizmo[1]-camY) << ", " << (gizmo[2]-camZ) << ")\n";
+    // Rest bone lengths (for the future IK): shoulder->forearm->hand.
+    float l1 = std::sqrt((fa[0]-sh[0])*(fa[0]-sh[0]) + (fa[1]-sh[1])*(fa[1]-sh[1]) + (fa[2]-sh[2])*(fa[2]-sh[2]));
+    float l2 = std::sqrt((hand[0]-fa[0])*(hand[0]-fa[0]) + (hand[1]-fa[1])*(hand[1]-fa[1]) + (hand[2]-fa[2])*(hand[2]-fa[2]));
+    out << "restLen shoulder->forearm=" << l1 << " forearm->hand=" << l2 << "\n";
+
+    // Full-IK (mode 4) intermediates from the last solve, in model space.
+    out << "IK chain: rArm=" << g_VRRightUpperArmIdx << " rFore=" << g_VRRightForeArmIdx
+        << " rHand=" << g_VRRightBoneIdx << " boneCount=" << g_VRBoneCount
+        << " bind=" << g_VRBind << "\n";
+    out << "IK target(model)   = (" << g_VRIKDbgTarget[0] << ", " << g_VRIKDbgTarget[1] << ", " << g_VRIKDbgTarget[2] << ")\n";
+    out << "IK shoulder(model) = (" << g_VRIKDbgShoulder[0] << ", " << g_VRIKDbgShoulder[1] << ", " << g_VRIKDbgShoulder[2] << ")\n";
+    out << "IK elbow(model)    = (" << g_VRIKDbgElbow[0] << ", " << g_VRIKDbgElbow[1] << ", " << g_VRIKDbgElbow[2] << ")\n";
+    out << "IK hand body(lx,ly,lz,cross) = (" << g_VRIKDbgLocal[0] << ", " << g_VRIKDbgLocal[1] << ", " << g_VRIKDbgLocal[2] << ", " << g_VRIKDbgLocal[3] << ")\n";
+    out << "IK lens upper=" << g_VRIKDbgLens[0] << " fore=" << g_VRIKDbgLens[1]
+        << " scale=" << g_VRBindScale << " yaw=" << g_VRPlayerYaw << "\n";
+    out << "LK target(model)   = (" << g_VRIKDbgTargetL[0] << ", " << g_VRIKDbgTargetL[1] << ", " << g_VRIKDbgTargetL[2] << ")\n";
+    out << "LK shoulder(model) = (" << g_VRIKDbgShoulderL[0] << ", " << g_VRIKDbgShoulderL[1] << ", " << g_VRIKDbgShoulderL[2] << ")\n";
+    out << "LK elbow(model)    = (" << g_VRIKDbgElbowL[0] << ", " << g_VRIKDbgElbowL[1] << ", " << g_VRIKDbgElbowL[2] << ")\n";
+    out << "LK hand body(lx,ly,lz,cross) = (" << g_VRIKDbgLocalL[0] << ", " << g_VRIKDbgLocalL[1] << ", " << g_VRIKDbgLocalL[2] << ", " << g_VRIKDbgLocalL[3] << ")\n";
+    out << "LK lens upper=" << g_VRIKDbgLensL[0] << " fore=" << g_VRIKDbgLensL[1] << "\n\n";
+
     if (aOut) *aOut = 1;
 }
 
@@ -3930,19 +4251,51 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
 
     auto f15q = RED4ext::CGlobalFunction::Create("SetVRBindParams", "SetVRBindParams", &SetVRBindParams);
     f15q->flags = flags; f15q->SetReturnType("Int32"); 
-    f15q->AddParam("Float", "scale"); f15q->AddParam("Float", "x"); f15q->AddParam("Float", "y"); f15q->AddParam("Float", "z"); f15q->AddParam("Int32", "axis");
+    f15q->AddParam("Float", "scale"); f15q->AddParam("Float", "x"); f15q->AddParam("Float", "y"); f15q->AddParam("Float", "z"); f15q->AddParam("Int32", "axis"); f15q->AddParam("Int32", "hand");
     rtti->RegisterFunction(f15q);
+
+    auto f15qE = RED4ext::CGlobalFunction::Create("SetVRElbowPole", "SetVRElbowPole", &SetVRElbowPole);
+    f15qE->flags = flags; f15qE->SetReturnType("Int32");
+    f15qE->AddParam("Float", "angle"); f15qE->AddParam("Int32", "hand");
+    rtti->RegisterFunction(f15qE);
+
+    auto f15qS = RED4ext::CGlobalFunction::Create("SetVRElbowSwing", "SetVRElbowSwing", &SetVRElbowSwing);
+    f15qS->flags = flags; f15qS->SetReturnType("Int32");
+    f15qS->AddParam("Float", "gain"); f15qS->AddParam("Int32", "hand");
+    rtti->RegisterFunction(f15qS);
+
+    auto f15qO = RED4ext::CGlobalFunction::Create("SetVRHandOffset", "SetVRHandOffset", &SetVRHandOffset);
+    f15qO->flags = flags; f15qO->SetReturnType("Int32");
+    f15qO->AddParam("Float", "pitch"); f15qO->AddParam("Float", "yaw"); f15qO->AddParam("Float", "roll"); f15qO->AddParam("Int32", "hand");
+    rtti->RegisterFunction(f15qO);
 
     auto f15r = RED4ext::CGlobalFunction::Create("SetVRBindBones", "SetVRBindBones", &SetVRBindBones);
     f15r->flags = flags; f15r->SetReturnType("Int32"); 
     f15r->AddParam("Int32", "leftIdx"); f15r->AddParam("Int32", "rightIdx");
     rtti->RegisterFunction(f15r);
 
+    auto f15rH = RED4ext::CGlobalFunction::Create("SetVRHeadBone", "SetVRHeadBone", &SetVRHeadBone);
+    f15rH->flags = flags; f15rH->SetReturnType("Int32"); f15rH->AddParam("Int32", "index"); rtti->RegisterFunction(f15rH);
+
+    auto f15rR = RED4ext::CGlobalFunction::Create("SetVRUseHeadRelative", "SetVRUseHeadRelative", &SetVRUseHeadRelative);
+    f15rR->flags = flags; f15rR->SetReturnType("Int32"); f15rR->AddParam("Int32", "on"); rtti->RegisterFunction(f15rR);
+
+    auto f15rC = RED4ext::CGlobalFunction::Create("SetVRDiagCapture", "SetVRDiagCapture", &SetVRDiagCapture);
+    f15rC->flags = flags; f15rC->SetReturnType("Int32"); f15rC->AddParam("Int32", "on"); rtti->RegisterFunction(f15rC);
+
+    auto f15rD = RED4ext::CGlobalFunction::Create("LogVRDiag", "LogVRDiag", &LogVRDiag);
+    f15rD->flags = flags; f15rD->SetReturnType("Int32");
+    f15rD->AddParam("Float", "camX"); f15rD->AddParam("Float", "camY"); f15rD->AddParam("Float", "camZ");
+    f15rD->AddParam("Float", "qi"); f15rD->AddParam("Float", "qj"); f15rD->AddParam("Float", "qk"); f15rD->AddParam("Float", "qr");
+    rtti->RegisterFunction(f15rD);
+
 
 
     auto f15s = RED4ext::CGlobalFunction::Create("SetVRPlayerYaw", "SetVRPlayerYaw", &SetVRPlayerYaw);
     f15s->flags = flags; f15s->SetReturnType("Int32");
     f15s->AddParam("Float", "yaw");
+    f15s->AddParam("Float", "ci"); f15s->AddParam("Float", "cj");
+    f15s->AddParam("Float", "ck"); f15s->AddParam("Float", "cr");
     rtti->RegisterFunction(f15s);
 
     auto f19 = RED4ext::CGlobalFunction::Create("DumpAnimVTable", "DumpAnimVTable", &DumpAnimVTable);

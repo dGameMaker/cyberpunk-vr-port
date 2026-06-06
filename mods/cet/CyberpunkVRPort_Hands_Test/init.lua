@@ -17,6 +17,43 @@ local chunkDebugBit2 = -1
 local chunkDebugBit3 = -1
 local needRestoreArms = true
 
+-- Per-hand IK calibration (defaults mirror the baked plugin defaults). Exposed via
+-- ImGui sliders so users with different arm lengths/heights can tune live.
+local calib = {
+    scaleR = 1.05, scaleL = 1.06,
+    heightR = 0.23, heightL = 0.23,
+    poleR = 0.0, poleL = 0.0,
+    swingR = 1.0, swingL = 1.0,
+    applied = false,
+}
+
+local function num(v, d) if type(v) == 'number' then return v else return d end end
+
+local function applyCalib()
+    -- Guard every value: a non-number (e.g. an ImGui binding quirk) must never reach
+    -- the plugin as scale, or both hands collapse to the anchor ("hands from the belly").
+    local sR, sL = num(calib.scaleR, 1.05), num(calib.scaleL, 1.06)
+    local hR, hL = num(calib.heightR, 0.23), num(calib.heightL, 0.23)
+    local pR, pL = num(calib.poleR, 0.0), num(calib.poleL, 0.0)
+    local wR, wL = num(calib.swingR, 1.0), num(calib.swingL, 1.0)
+    calib.scaleR, calib.scaleL = sR, sL
+    calib.heightR, calib.heightL = hR, hL
+    calib.poleR, calib.poleL = pR, pL
+    calib.swingR, calib.swingL = wR, wL
+    if type(SetVRBindParams) == 'function' then
+        pcall(function() SetVRBindParams(sR, 0.0, 0.0, hR, 1, 0) end) -- hand 0 = right
+        pcall(function() SetVRBindParams(sL, 0.0, 0.0, hL, 1, 1) end) -- hand 1 = left
+    end
+    if type(SetVRElbowPole) == 'function' then
+        pcall(function() SetVRElbowPole(pR, 0) end)
+        pcall(function() SetVRElbowPole(pL, 1) end)
+    end
+    if type(SetVRElbowSwing) == 'function' then
+        pcall(function() SetVRElbowSwing(wR, 0) end)
+        pcall(function() SetVRElbowSwing(wL, 1) end)
+    end
+end
+
 local status = {
     debugVisualizer = false,
     debugSource = "none",
@@ -315,7 +352,7 @@ registerHotkey('ToggleVRHands', 'Toggle VR Hands', function()
     if vrTrackingEnabled then
         pcall(function() Game.InstallVRAnimPoseHook() end)
         pcall(function() Game.ArmVRAnimPosePlayer() end)
-        pcall(function() Game.SetVRBindMode(2) end)
+        pcall(function() Game.SetVRBindMode(4) end)  -- 4 = full-arm model-space IK
     else
         pcall(function() Game.SetVRBindMode(0) end)
     end
@@ -323,6 +360,20 @@ end)
 
 registerHotkey('ToggleMouseY', 'Toggle Disable Mouse Y', function()
     mouseDisableEnabled = not mouseDisableEnabled
+end)
+
+-- Last FPP camera world pose, captured each frame for the diagnostic logger.
+local lastCamPos = nil
+local lastCamQuat = nil
+
+registerHotkey('LogVRDiag', 'Log VR Hand Diagnostic', function()
+    if type(SetVRDiagCapture) == 'function' then pcall(function() SetVRDiagCapture(1) end) end
+    if type(LogVRDiag) == 'function' and lastCamPos and lastCamQuat then
+        pcall(function()
+            LogVRDiag(lastCamPos.x, lastCamPos.y, lastCamPos.z,
+                      lastCamQuat.i, lastCamQuat.j, lastCamQuat.k, lastCamQuat.r)
+        end)
+    end
 end)
 
 registerForEvent('onUpdate', function(dt)
@@ -362,6 +413,14 @@ registerForEvent('onUpdate', function(dt)
     -- VR Transforms Update for Model-Space IK
     local camPos, camQuat = getCameraWorldPose(player)
     if not camPos or not camQuat then return end
+
+    -- Remember the camera pose for the diagnostic logger hotkey, and keep the
+    -- pre-write bone snapshot fresh while tracking is active.
+    lastCamPos = camPos
+    lastCamQuat = camQuat
+    if vrTrackingEnabled and type(SetVRDiagCapture) == 'function' then
+        pcall(function() SetVRDiagCapture(1) end)
+    end
 
     if type(SetVRPlayerYaw) == 'function' then
         local ok2, playerOri = pcall(function() return player:GetWorldOrientation() end)
@@ -408,7 +467,8 @@ registerForEvent('onDraw', function()
         if vrTrackingEnabled then
             pcall(function() Game.InstallVRAnimPoseHook() end)
             pcall(function() Game.ArmVRAnimPosePlayer() end)
-            pcall(function() Game.SetVRBindMode(2) end)
+            pcall(function() Game.SetVRBindMode(4) end)  -- 4 = full-arm model-space IK
+            applyCalib()
         else
             pcall(function() Game.SetVRBindMode(0) end)
         end
@@ -418,6 +478,50 @@ registerForEvent('onDraw', function()
     if mouseChanged then
         mouseDisableEnabled = newMouse
     end
+
+    if ImGui.Button('Log VR Diag (gizmo vs bones)') then
+        if type(SetVRDiagCapture) == 'function' then pcall(function() SetVRDiagCapture(1) end) end
+        if type(LogVRDiag) == 'function' and lastCamPos and lastCamQuat then
+            local ok = pcall(function()
+                LogVRDiag(lastCamPos.x, lastCamPos.y, lastCamPos.z,
+                          lastCamQuat.i, lastCamQuat.j, lastCamQuat.k, lastCamQuat.r)
+            end)
+            dumpStatus = ok and 'diag logged -> vrik_diag.txt' or 'diag log failed'
+        else
+            dumpStatus = 'diag: no cam pose yet (move once)'
+        end
+    end
+    ImGui.Separator()
+    ImGui.Text('Hand IK Calibration (per arm length / height)')
+
+    -- CET ImGui.SliderFloat returns (value, changed) -- value FIRST.
+    local used
+    calib.scaleR, used = ImGui.SliderFloat('Reach scale R', num(calib.scaleR, 1.05), 0.90, 1.30)
+    if used then applyCalib() end
+    calib.scaleL, used = ImGui.SliderFloat('Reach scale L', num(calib.scaleL, 1.06), 0.90, 1.30)
+    if used then applyCalib() end
+    calib.heightR, used = ImGui.SliderFloat('Height R', num(calib.heightR, 0.23), -0.30, 0.60)
+    if used then applyCalib() end
+    calib.heightL, used = ImGui.SliderFloat('Height L', num(calib.heightL, 0.23), -0.30, 0.60)
+    if used then applyCalib() end
+    calib.poleR, used = ImGui.SliderFloat('Elbow pole R', num(calib.poleR, 0.0), -180.0, 180.0)
+    if used then applyCalib() end
+    calib.poleL, used = ImGui.SliderFloat('Elbow pole L', num(calib.poleL, 0.0), -180.0, 180.0)
+    if used then applyCalib() end
+    calib.swingR, used = ImGui.SliderFloat('Elbow swing R', num(calib.swingR, 1.0), 0.0, 3.0)
+    if used then applyCalib() end
+    calib.swingL, used = ImGui.SliderFloat('Elbow swing L', num(calib.swingL, 1.0), 0.0, 3.0)
+    if used then applyCalib() end
+    if ImGui.Button('Apply calibration') then applyCalib() end
+    ImGui.SameLine()
+    if ImGui.Button('Reset calibration') then
+        calib.scaleR, calib.scaleL = 1.05, 1.06
+        calib.heightR, calib.heightL = 0.23, 0.23
+        calib.poleR, calib.poleL = 0.0, 0.0
+        calib.swingR, calib.swingL = 1.0, 1.0
+        applyCalib()
+    end
+
     ImGui.Separator()
 
     ImGui.Text('DebugVisualizer: ' .. tostring(status.debugVisualizer))
